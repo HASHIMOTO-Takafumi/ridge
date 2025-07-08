@@ -42,6 +42,16 @@ type Response struct {
 	IsBase64Encoded   bool              `json:"isBase64Encoded"`
 }
 
+// RestResponse represents a response for REST API Gateway proxy integration.
+// This structure excludes the cookies field which is not allowed in REST API responses.
+type RestResponse struct {
+	StatusCode        int               `json:"statusCode"`
+	Headers           map[string]string `json:"headers"`
+	MultiValueHeaders http.Header       `json:"multiValueHeaders"`
+	Body              string            `json:"body"`
+	IsBase64Encoded   bool              `json:"isBase64Encoded"`
+}
+
 // WriteTo writes response to http.ResponseWriter.
 func (r *Response) WriteTo(w http.ResponseWriter) (int64, error) {
 	for k, vs := range r.MultiValueHeaders {
@@ -61,6 +71,23 @@ func (r *Response) WriteTo(w http.ResponseWriter) (int64, error) {
 	return int64(n), err
 }
 
+// WriteTo writes REST API response to http.ResponseWriter.
+func (r *RestResponse) WriteTo(w http.ResponseWriter) (int64, error) {
+	for k, vs := range r.MultiValueHeaders {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	// Note: No cookies are written for REST API responses
+	w.WriteHeader(r.StatusCode)
+	if r.IsBase64Encoded {
+		dec := base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.Body))
+		return io.Copy(w, dec)
+	}
+	n, err := io.WriteString(w, r.Body)
+	return int64(n), err
+}
+
 // NewResponseWriter creates ResponseWriter
 func NewResponseWriter() *ResponseWriter {
 	w := &ResponseWriter{
@@ -71,11 +98,23 @@ func NewResponseWriter() *ResponseWriter {
 	return w
 }
 
+// NewResponseWriterWithAPIType creates ResponseWriter with API type
+func NewResponseWriterWithAPIType(apiType string) *ResponseWriter {
+	w := &ResponseWriter{
+		Buffer:     bytes.Buffer{},
+		statusCode: http.StatusOK,
+		header:     make(http.Header),
+		apiType:    apiType,
+	}
+	return w
+}
+
 // ResponseWriter represents a response writer implements http.ResponseWriter.
 type ResponseWriter struct {
 	bytes.Buffer
 	header     http.Header
 	statusCode int
+	apiType    string
 }
 
 func (w *ResponseWriter) Header() http.Header {
@@ -87,6 +126,18 @@ func (w *ResponseWriter) WriteHeader(code int) {
 }
 
 func (w *ResponseWriter) Response() Response {
+	// For backward compatibility, use ResponseForAPIType and assert to Response type
+	resp := w.ResponseForAPIType()
+	if httpResp, ok := resp.(Response); ok {
+		return httpResp
+	}
+	// This should not happen with REST API - REST API should not call Response()
+	// REST API responses should use ResponseForAPIType() directly
+	panic("Response() called on REST API ResponseWriter - use ResponseForAPIType() instead")
+}
+
+// ResponseForAPIType returns appropriate response type based on API type
+func (w *ResponseWriter) ResponseForAPIType() interface{} {
 	body := w.String()
 	isBase64Encoded := false
 
@@ -103,6 +154,17 @@ func (w *ResponseWriter) Response() Response {
 	}
 	if isBase64Encoded {
 		body = base64.StdEncoding.EncodeToString(w.Bytes())
+	}
+
+	// Return appropriate response type based on API type
+	if w.apiType == PayloadTypeRESTAPI {
+		return RestResponse{
+			StatusCode:        w.statusCode,
+			Headers:           h,
+			MultiValueHeaders: w.header,
+			Body:              body,
+			IsBase64Encoded:   isBase64Encoded,
+		}
 	}
 
 	return Response{
@@ -241,6 +303,7 @@ type Ridge struct {
 	Prefix            string
 	Mux               http.Handler
 	RequestBuilder    func(json.RawMessage) (*http.Request, error)
+	RequestBuilderWithAPIType func(json.RawMessage) (*http.Request, string, error)
 	TermHandler       func()
 	ProxyProtocol     bool
 	StreamingResponse bool
@@ -253,11 +316,12 @@ const (
 // New creates a new Ridge.
 func New(address, prefix string, mux http.Handler) *Ridge {
 	return &Ridge{
-		Address:        address,
-		Prefix:         prefix,
-		Mux:            mux,
-		RequestBuilder: NewRequest,
-		ProxyProtocol:  ProxyProtocol,
+		Address:                   address,
+		Prefix:                    prefix,
+		Mux:                       mux,
+		RequestBuilder:            NewRequest,
+		RequestBuilderWithAPIType: NewRequestWithAPIType,
+		ProxyProtocol:             ProxyProtocol,
 	}
 }
 
@@ -329,7 +393,17 @@ func (r *Ridge) mountMux() http.Handler {
 
 func (r *Ridge) runAsLambdaHandler(ctx context.Context) {
 	handler := func(ctx context.Context, event json.RawMessage) (interface{}, error) {
-		req, err := r.RequestBuilder(event)
+		var req *http.Request
+		var apiType string
+		var err error
+		
+		// Try to get API type if available
+		if r.RequestBuilderWithAPIType != nil {
+			req, apiType, err = r.RequestBuilderWithAPIType(event)
+		} else {
+			req, err = r.RequestBuilder(event)
+		}
+		
 		if err != nil {
 			log.Println(err)
 			return nil, err
@@ -339,9 +413,9 @@ func (r *Ridge) runAsLambdaHandler(ctx context.Context) {
 			req.Header.Set("Lambda-Runtime-Invoked-Function-Arn", lc.InvokedFunctionArn)
 		}
 		if !r.StreamingResponse {
-			w := NewResponseWriter()
+			w := NewResponseWriterWithAPIType(apiType)
 			r.mountMux().ServeHTTP(w, req.WithContext(ctx))
-			return w.Response(), nil
+			return w.ResponseForAPIType(), nil
 		}
 		w := NewStreamingResponseWriter()
 		go func() {

@@ -16,6 +16,13 @@ const RequestIDHeaderName = "X-Amzn-RequestId"
 // PayloadVersion when this variable set, Ridge disables auto detection payload version.
 var PayloadVersion string
 
+// Payload types for API Gateway
+const (
+	PayloadTypeHTTPAPIv1 = "1.0"
+	PayloadTypeHTTPAPIv2 = "2.0"
+	PayloadTypeRESTAPI   = "rest"
+)
+
 // RequestV1 represents an HTTP request received by an API Gateway proxy integrations. (v1.0)
 // https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html
 type RequestV1 struct {
@@ -37,34 +44,73 @@ type RequestV1 struct {
 // Request is alias to RequestV1
 type Request = RequestV1
 
+// detectPayloadType determines the API Gateway payload type
+func detectPayloadType(event json.RawMessage) (string, error) {
+	var payload struct {
+		Version        string `json:"version"`
+		RequestContext struct {
+			Stage string `json:"stage"`
+		} `json:"requestContext"`
+	}
+	
+	if err := json.Unmarshal(event, &payload); err != nil {
+		return "", err
+	}
+	
+	switch payload.Version {
+	case "2.0":
+		return PayloadTypeHTTPAPIv2, nil
+	case "1.0":
+		return PayloadTypeHTTPAPIv1, nil
+	case "":
+		// Empty version with requestContext.stage indicates REST API
+		if payload.RequestContext.Stage != "" {
+			return PayloadTypeRESTAPI, nil
+		}
+		// Default to HTTP API v1 if no stage
+		return PayloadTypeHTTPAPIv1, nil
+	default:
+		return "", fmt.Errorf("unsupported payload version: %s", payload.Version)
+	}
+}
+
 // NewRequest creates *net/http.Request from a Request.
 func NewRequest(event json.RawMessage) (*http.Request, error) {
-	var r struct {
-		Version string `json:"version"`
-	}
+	req, _, err := NewRequestWithAPIType(event)
+	return req, err
+}
+
+// NewRequestWithAPIType creates *net/http.Request from a Request and returns the API type.
+func NewRequestWithAPIType(event json.RawMessage) (*http.Request, string, error) {
+	var payloadType string
+	var err error
+	
 	if PayloadVersion == "" {
-		if err := json.Unmarshal(event, &r); err != nil {
-			return nil, err
+		payloadType, err = detectPayloadType(event)
+		if err != nil {
+			return nil, "", err
 		}
 	} else {
-		r.Version = PayloadVersion
+		payloadType = PayloadVersion
 	}
 
-	switch r.Version {
-	case "2.0":
+	switch payloadType {
+	case PayloadTypeHTTPAPIv2:
 		var rv2 RequestV2
 		if err := json.Unmarshal(event, &rv2); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return rv2.httpRequest()
-	case "1.0", "":
+		req, err := rv2.httpRequest()
+		return req, payloadType, err
+	case PayloadTypeHTTPAPIv1, PayloadTypeRESTAPI:
 		var rv1 RequestV1
 		if err := json.Unmarshal(event, &rv1); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return rv1.httpRequest()
+		req, err := rv1.httpRequest()
+		return req, payloadType, err
 	default:
-		return nil, fmt.Errorf("payload Version %s is not supported", r.Version)
+		return nil, "", fmt.Errorf("payload type %s is not supported", payloadType)
 	}
 }
 
