@@ -299,14 +299,14 @@ func RunWithContext(ctx context.Context, address, prefix string, mux http.Handle
 
 // Ridge is a struct to run http handler on AWS Lambda runtime or net/http's server.
 type Ridge struct {
-	Address           string
-	Prefix            string
-	Mux               http.Handler
-	RequestBuilder    func(json.RawMessage) (*http.Request, error)
+	Address                   string
+	Prefix                    string
+	Mux                       http.Handler
+	RequestBuilder            func(json.RawMessage) (*http.Request, error)
 	RequestBuilderWithAPIType func(json.RawMessage) (*http.Request, string, error)
-	TermHandler       func()
-	ProxyProtocol     bool
-	StreamingResponse bool
+	TermHandler               func()
+	ProxyProtocol             bool
+	StreamingResponse         bool
 }
 
 const (
@@ -396,16 +396,19 @@ func (r *Ridge) runAsLambdaHandler(ctx context.Context) {
 		var req *http.Request
 		var apiType string
 		var err error
-		
+
 		// Try to get API type if available
 		if r.RequestBuilderWithAPIType != nil {
 			req, apiType, err = r.RequestBuilderWithAPIType(event)
+			if err == nil {
+				log.Printf("Ridge: Detected API Gateway type: %s", apiType)
+			}
 		} else {
+			log.Printf("Ridge: Falling back to RequestBuilder")
 			req, err = r.RequestBuilder(event)
 		}
-		
+
 		if err != nil {
-			log.Println(err)
 			return nil, err
 		}
 		if lc, ok := lambdacontext.FromContext(ctx); ok {
